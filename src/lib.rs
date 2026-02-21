@@ -315,6 +315,17 @@ where
                     log::warn!("Too many sessions that over {max_sessions}, dropping new session");
                     continue;
                 }
+                // https://github.com/tun2proxy/tun2proxy/issues/231
+                if cfg!(windows) {
+                    let dst_port = udp.peer_addr().port();
+                    if dst_port == 137  // NetBIOS
+                        || dst_port == 5353 // mDNS
+                        || dst_port == 5355 // LLMNR
+                        || dst_port == 1900 // SSDP
+                    {
+                        continue;
+                    }
+                }
                 log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
                 let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
                 if info.dst.port() == DNS_PORT {
