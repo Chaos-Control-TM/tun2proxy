@@ -58,7 +58,7 @@ env_logger = { version = "0.11.11", default-features = false, features = [
 hashlink = "0.12.2"
 hickory-proto = "0.26.3"
 httparse = "1.10.1"
-ipstack = { version = "1.0.1" }
+ipstack = { version = "1.0.1", path = "vendor/ipstack" }
 log = { version = "0.4.35", default-features = false, features = [
     "std",
     "serde",
