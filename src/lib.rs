@@ -461,6 +461,7 @@ where
                     log::warn!("Too many sessions that over {max_sessions}, dropping new session");
                     continue;
                 }
+                if cfg!(windows) && matches!(udp.peer_addr().port(), 137 | 5353 | 5355 | 1900) { continue; }
                 let session_count = SessionCountGuard::new(task_count.clone());
                 let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
                 if info.dst.port() == DNS_PORT {

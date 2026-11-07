@@ -74,26 +74,18 @@ pub fn general_run_for_api(args: Args, tun_mtu: u16, packet_information: bool) -
         return -3;
     };
     let args_clone = args.clone();
-    let (timer_cancel_tx, timer_cancel_rx) = std::sync::mpsc::channel();
-    let (res, timer_handle) = rt.block_on(async move {
-        let ret = general_run_async(args_clone, tun_mtu, packet_information, shutdown_token).await;
-        // Spawn a std thread to force exit after timeout so it isn't cancelled
-        // when the tokio runtime is dropped.
-        let timer_handle = std::thread::spawn(move || {
-            if timer_cancel_rx.recv_timeout(crate::FORCE_EXIT_TIMEOUT).is_err() {
-                // Delay some seconds then try to exit current process if not exited yet, normally this case should not happen
-                log::info!("Forcing exit now.");
-                std::process::exit(-1);
-            }
-            log::info!("Exit timer cancelled. Exiting normally without forcing exit.");
-        });
-        tokio::time::sleep(std::time::Duration::from_micros(100)).await;
-        (ret, timer_handle)
-    });
-    drop(rt);
-    let _ = timer_cancel_tx.send(());
-    let _ = timer_handle.join();
-    log::info!("General run for API exiting normally.");
+    log::info!("tun2proxy (DLL): entering runtime.block_on...");
+    let res = rt.block_on(async move { general_run_async(args_clone, tun_mtu, packet_information, shutdown_token).await });
+    log::info!("tun2proxy (DLL): runtime.block_on returned");
+
+    // This is a DLL/API entrypoint: never terminate the host process.
+    // Use a bounded runtime shutdown to avoid potentially blocking forever on Drop.
+    log::info!(
+        "tun2proxy (DLL): shutting down tokio runtime (timeout: {:?})...",
+        crate::FORCE_EXIT_TIMEOUT
+    );
+    rt.shutdown_timeout(crate::FORCE_EXIT_TIMEOUT);
+    log::info!("tun2proxy (DLL): tokio runtime shutdown complete");
 
     match res {
         Ok(sessions) => {

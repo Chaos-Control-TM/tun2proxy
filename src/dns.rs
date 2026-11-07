@@ -55,7 +55,7 @@ pub fn extract_ipaddr_from_dns_message(message: &Message) -> std::io::Result<IpA
 pub fn extract_domain_from_dns_message(message: &Message) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind::InvalidData};
     let query = message.queries.first().ok_or(Error::new(InvalidData, "DnsRequest no query body"))?;
-    let name = query.name().to_string();
+    let name = query.name().to_ascii();
     Ok(name)
 }
 
@@ -70,4 +70,45 @@ pub fn parse_data_to_dns_message(data: &[u8], used_by_tcp: bool) -> std::io::Res
     }
     let message = Message::from_vec(data).map_err(|e| Error::new(InvalidData, e))?;
     Ok(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::{
+        op::Query,
+        rr::RecordType,
+    };
+
+    fn dns_query_message(domain: &str) -> Message {
+        let name = Name::from_utf8(domain).expect("valid UTF-8 domain");
+        let mut message = Message::new(0, hickory_proto::op::MessageType::Query, hickory_proto::op::OpCode::Query);
+        message.add_query(Query::query(name, RecordType::A));
+        message
+    }
+
+    #[test]
+    fn extract_domain_returns_punycode_for_idn_domains() {
+        let cases = [
+            ("пример.рф", "xn--e1afmkfd.xn--p1ai"),
+            ("тест.рус", "xn--e1aybc.xn--p1acf"),
+        ];
+
+        for (utf8_domain, expected_ascii) in cases {
+            let message = dns_query_message(utf8_domain);
+            let extracted = extract_domain_from_dns_message(&message).expect("domain extraction");
+            assert_eq!(extracted, expected_ascii, "domain: {utf8_domain}");
+            assert!(
+                extracted.is_ascii(),
+                "expected ASCII punycode for {utf8_domain}, got {extracted}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_domain_preserves_ascii_domains() {
+        let message = dns_query_message("example.com");
+        let extracted = extract_domain_from_dns_message(&message).expect("domain extraction");
+        assert_eq!(extracted, "example.com");
+    }
 }
