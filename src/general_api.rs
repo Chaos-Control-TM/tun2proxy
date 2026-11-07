@@ -25,6 +25,48 @@ pub unsafe extern "C" fn tun2proxy_run_with_cli_args(cli_args: *const c_char, tu
     general_run_for_api(args, tun_mtu, packet_information)
 }
 
+// Preserve the named-interface C ABI consumed by the Windows service.
+fn named_interface_args(proxy: &str, tun_name: &str, bypass: &str, dns: c_int, verbosity: c_int) -> Option<Args> {
+    let mut args = Args::default();
+    args.proxy(socks5_impl::ProxyParameters::try_from(proxy).ok()?)
+        .tun(tun_name.to_owned())
+        .dns(match dns { 0 => crate::args::ArgDns::Virtual, 1 => crate::args::ArgDns::OverTcp, 2 => crate::args::ArgDns::Direct, _ => return None })
+        .verbosity(match verbosity { 0 => log::LevelFilter::Off, 1 => log::LevelFilter::Error, 2 => log::LevelFilter::Warn, 3 => log::LevelFilter::Info, 4 => log::LevelFilter::Debug, 5 => log::LevelFilter::Trace, _ => return None });
+    if !bypass.is_empty() { args.bypass(bypass.parse().ok()?); }
+    Some(args)
+}
+
+/// # Safety
+/// Non-null arguments must point to valid NUL-terminated strings for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tun2proxy_with_name_run(proxy_url: *const c_char, tun_name: *const c_char, bypass: *const c_char, dns_strategy: c_int, root_privilege: bool, verbosity: c_int) -> c_int {
+    if proxy_url.is_null() || tun_name.is_null() || bypass.is_null() { return -5; }
+    let (Ok(proxy), Ok(name), Ok(bypass)) = (unsafe { std::ffi::CStr::from_ptr(proxy_url) }.to_str(), unsafe { std::ffi::CStr::from_ptr(tun_name) }.to_str(), unsafe { std::ffi::CStr::from_ptr(bypass) }.to_str()) else { return -5; };
+    let Some(mut args) = named_interface_args(proxy, name, bypass, dns_strategy, verbosity) else { return -7; };
+    if cfg!(target_os = "linux") { args.setup(root_privilege); }
+    general_run_for_api(args, tun::DEFAULT_MTU, false)
+}
+
+#[cfg(test)]
+mod named_interface_tests {
+    use super::*;
+    #[test]
+    fn preserves_windows_service_options() {
+        let args = named_interface_args("socks5://127.0.0.1:12735", "chaostun", "10.255.255.255/32", 0, 4).unwrap();
+        assert_eq!(args.tun.as_deref(), Some("chaostun"));
+        assert_eq!(args.dns, crate::args::ArgDns::Virtual);
+        assert_eq!(args.verbosity, log::LevelFilter::Debug);
+        assert_eq!(args.setup, !cfg!(target_os = "linux"));
+    }
+    #[test]
+    fn invalid_parameters_return_errors_without_panicking() {
+        assert!(named_interface_args("invalid", "chaostun", "", 0, 4).is_none());
+        assert!(named_interface_args("socks5://127.0.0.1:1", "chaostun", "invalid", 0, 4).is_none());
+        assert!(named_interface_args("socks5://127.0.0.1:1", "chaostun", "", 8, 4).is_none());
+        assert_eq!(unsafe { tun2proxy_with_name_run(std::ptr::null(), std::ptr::null(), std::ptr::null(), 0, false, 0) }, -5);
+    }
+}
+
 static TUN_QUIT: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>> = std::sync::Mutex::new(None);
 
 struct RunTokenGuard;
