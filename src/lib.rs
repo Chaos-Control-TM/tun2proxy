@@ -53,6 +53,8 @@ mod dns;
 mod dump_logger;
 mod error;
 mod general_api;
+#[cfg(windows)]
+mod windows_network;
 mod http;
 mod no_proxy;
 mod proxy_handler;

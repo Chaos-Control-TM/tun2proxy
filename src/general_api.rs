@@ -47,6 +47,36 @@ pub unsafe extern "C" fn tun2proxy_with_name_run(proxy_url: *const c_char, tun_n
     general_run_for_api(args, tun::DEFAULT_MTU, false)
 }
 
+// Copied per run, never stored globally or reused by a later session.
+#[derive(Clone, Copy, Default)]
+struct StartupObserver {
+    callback: Option<unsafe extern "C" fn(c_int, u64, u32, c_int, *const c_char, *mut std::ffi::c_void) -> c_int>,
+    context: usize,
+}
+impl StartupObserver {
+    fn notify(self, stage: i32, luid: u64, index: u32, error: i32, message: &str) -> std::io::Result<()> {
+        if let Some(callback) = self.callback {
+            let message = std::ffi::CString::new(message.replace('\0', " ")).unwrap();
+            if unsafe { callback(stage, luid, index, error, message.as_ptr(), self.context as *mut _) } != 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "startup cancelled by service"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// # Safety
+/// All pointers must remain valid until this blocking call returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tun2proxy_with_name_run_v2(proxy: *const c_char, name: *const c_char,
+    verbosity: c_int, callback: Option<unsafe extern "C" fn(c_int, u64, u32, c_int, *const c_char, *mut std::ffi::c_void) -> c_int>,
+    context: *mut std::ffi::c_void) -> c_int {
+    if proxy.is_null() || name.is_null() { return -5; }
+    let (Ok(proxy), Ok(name)) = (unsafe { std::ffi::CStr::from_ptr(proxy) }.to_str(), unsafe { std::ffi::CStr::from_ptr(name) }.to_str()) else { return -5; };
+    let Some(args) = named_interface_args(proxy, name, "", 0, verbosity) else { return -7; };
+    run_for_api(args, tun::DEFAULT_MTU, false, StartupObserver { callback, context: context as usize })
+}
+
 #[cfg(test)]
 mod named_interface_tests {
     use super::*;
@@ -93,6 +123,10 @@ pub(crate) fn tun2proxy_stop_internal() -> c_int {
 }
 
 pub fn general_run_for_api(args: Args, tun_mtu: u16, packet_information: bool) -> c_int {
+    run_for_api(args, tun_mtu, packet_information, StartupObserver::default())
+}
+
+fn run_for_api(args: Args, tun_mtu: u16, packet_information: bool, observer: StartupObserver) -> c_int {
     log::set_max_level(args.verbosity);
     if let Err(err) = log::set_boxed_logger(Box::<crate::dump_logger::DumpLogger>::default()) {
         log::debug!("set logger error: {err}");
@@ -117,7 +151,10 @@ pub fn general_run_for_api(args: Args, tun_mtu: u16, packet_information: bool) -
     };
     let args_clone = args.clone();
     log::info!("tun2proxy (DLL): entering runtime.block_on...");
-    let res = rt.block_on(async move { general_run_async(args_clone, tun_mtu, packet_information, shutdown_token).await });
+    let res = rt.block_on(async move { run_async(args_clone, tun_mtu, packet_information, shutdown_token, observer).await });
+    if let Err(ref error) = res {
+        let _ = observer.notify(4, 0, 0, error.raw_os_error().unwrap_or(0), &error.to_string());
+    }
     log::info!("tun2proxy (DLL): runtime.block_on returned");
 
     // This is a DLL/API entrypoint: never terminate the host process.
@@ -148,6 +185,11 @@ pub async fn general_run_async(
     _packet_information: bool,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<usize> {
+    run_async(args, tun_mtu, _packet_information, shutdown_token, StartupObserver::default()).await
+}
+
+async fn run_async(args: Args, tun_mtu: u16, _packet_information: bool,
+    shutdown_token: tokio_util::sync::CancellationToken, observer: StartupObserver) -> std::io::Result<usize> {
     let mut args = args;
     let _proxy_addr = if let Some(addr) = args.proxy.addr.as_ref()
         && let Some(addr) = addr.resolve_using_tokio().await?.next()
@@ -164,7 +206,9 @@ pub async fn general_run_async(
     {
         use tproxy_config::{TUN_GATEWAY, TUN_IPV4, TUN_NETMASK};
         tun_config.address(TUN_IPV4).netmask(TUN_NETMASK).mtu(tun_mtu).up();
-        tun_config.destination(TUN_GATEWAY);
+        // The service installs WFP before traffic routes. The old entrypoint
+        // retains upstream behavior for compatibility with other callers.
+        if !cfg!(windows) || observer.callback.is_none() { tun_config.destination(TUN_GATEWAY); }
     }
 
     #[cfg(unix)]
@@ -191,6 +235,11 @@ pub async fn general_run_async(
     #[cfg(target_os = "windows")]
     tun_config.platform_config(|cfg| {
         cfg.device_guid(12324323423423434234_u128);
+        // Load the driver next to this DLL, independent of the SCM working directory.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() { cfg.wintun_file(dir.join("wintun.dll")); }
+        }
+        if observer.callback.is_some() { cfg.dns_servers(&[tproxy_config::TUN_GATEWAY]); }
     });
 
     #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -206,7 +255,18 @@ pub async fn general_run_async(
         .bypass_ips(&args.bypass)
         .ipv6_default_route(args.ipv6_enabled);
 
+    observer.notify(1, 0, 0, 0, "adapter_create")?;
     let device = tun::create_as_async(&tun_config)?;
+    if shutdown_token.is_cancelled() { return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "startup cancelled")); }
+    #[cfg(windows)]
+    let _owned_routes = if observer.callback.is_some() {
+        use tun::{AbstractDevice, AbstractDeviceExt};
+        let luid = device.tun_luid();
+        let index = device.tun_index()? as u32;
+        observer.notify(2, luid, index, 0, "adapter_ready")?;
+        if shutdown_token.is_cancelled() { return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "startup cancelled")); }
+        Some(crate::windows_network::Routes::install(luid, index)?)
+    } else { None };
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     if let Ok(tun_name) = tun::AbstractDevice::tun_name(&*device) {
@@ -220,7 +280,7 @@ pub async fn general_run_async(
     let mut restore: Option<tproxy_config::TproxyState> = None;
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    if args.setup {
+    if args.setup && (!cfg!(windows) || observer.callback.is_none()) {
         restore = Some(tproxy_config::tproxy_setup(&tproxy_args).await?);
     }
 
@@ -248,6 +308,7 @@ pub async fn general_run_async(
         }
     }
 
+    observer.notify(3, 0, 0, 0, "routes_ready")?;
     let join_handle = tokio::spawn(crate::run(device, tun_mtu, args.clone(), shutdown_token.clone()));
 
     match join_handle.await? {
